@@ -597,22 +597,20 @@ mod tests {
 
     #[test]
     fn test_try_cast_timestamp_overflow_returns_null() -> Result<()> {
-        let schema = Schema::new(vec![Field::new(
-            "a",
-            DataType::Timestamp(TimeUnit::Second, None),
-            true,
-        )]);
+        let filed = Field::new("a", DataType::Timestamp(TimeUnit::Second, None), true);
+        let schema = Schema::new(vec![filed]);
         let overflow_value = i64::MAX / 1_000_000_000 + 1;
         let array = TimestampSecondArray::from(vec![Some(1), Some(overflow_value)]);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])?;
+
         let expression = try_cast(
             col("a", &schema)?,
             &schema,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
         )?;
 
-        let result = expression.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let rb = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
+
+        let result = expression.evaluate(&rb)?.into_array(rb.num_rows())?;
         let result = result
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()

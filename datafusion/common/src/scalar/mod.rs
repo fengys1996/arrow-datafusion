@@ -4288,6 +4288,9 @@ impl ScalarValue {
             });
         }
 
+        // Temporal casts that increase precision can overflow when the value is
+        // scaled to the target unit. For safe casts, return NULL for the
+        // overflowing scalar; otherwise preserve the regular cast error.
         if let Some(multiplier) = date_to_timestamp_multiplier(&source_type, target_type)
             .or_else(|| timestamp_to_timestamp_multiplier(&source_type, target_type))
             && let Some(value) = self.temporal_scalar_value_as_i64()
