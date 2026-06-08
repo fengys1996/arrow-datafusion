@@ -325,7 +325,14 @@ fn cast_array_by_name(
     ) {
         datafusion_common::nested_struct::cast_column(array, cast_type, cast_options)
     } else {
-        ensure_temporal_array_timestamp_bounds(array, cast_type)?;
+        if cast_options.safe {
+            if let Some(casted) = safe_cast_temporal_array_to_timestamp(array, cast_type)?
+            {
+                return Ok(casted);
+            }
+        } else {
+            ensure_temporal_array_timestamp_bounds(array, cast_type)?;
+        }
         Ok(kernels::cast::cast_with_options(
             array,
             cast_type,
@@ -437,6 +444,139 @@ fn ensure_temporal_array_timestamp_bounds(
     Ok(())
 }
 
+fn safe_cast_temporal_array_to_timestamp(
+    array: &ArrayRef,
+    cast_type: &DataType,
+) -> Result<Option<ArrayRef>> {
+    let source_type = array.data_type().clone();
+    let Some(multiplier) = date_to_timestamp_multiplier(&source_type, cast_type)
+        .or_else(|| timestamp_to_timestamp_multiplier(&source_type, cast_type))
+    else {
+        return Ok(None);
+    };
+
+    if multiplier <= 1 {
+        return Ok(None);
+    }
+
+    let values = temporal_array_values_as_i64(array)?;
+    let values = values
+        .into_iter()
+        .map(|value| value.and_then(|value| value.checked_mul(multiplier)))
+        .collect::<Vec<_>>();
+
+    let DataType::Timestamp(unit, timezone) = cast_type else {
+        return Ok(None);
+    };
+
+    let array: ArrayRef = match unit {
+        TimeUnit::Second => Arc::new(
+            TimestampSecondArray::from(values).with_timezone_opt(timezone.clone()),
+        ),
+        TimeUnit::Millisecond => Arc::new(
+            TimestampMillisecondArray::from(values).with_timezone_opt(timezone.clone()),
+        ),
+        TimeUnit::Microsecond => Arc::new(
+            TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone()),
+        ),
+        TimeUnit::Nanosecond => Arc::new(
+            TimestampNanosecondArray::from(values).with_timezone_opt(timezone.clone()),
+        ),
+    };
+
+    Ok(Some(array))
+}
+
+fn temporal_array_values_as_i64(array: &ArrayRef) -> Result<Vec<Option<i64>>> {
+    match array.data_type() {
+        DataType::Date32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected Date32Array but found {}",
+                        array.data_type()
+                    )
+                })?;
+            Ok((0..arr.len())
+                .map(|i| (!arr.is_null(i)).then(|| i64::from(arr.value(i))))
+                .collect())
+        }
+        DataType::Date64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected Date64Array but found {}",
+                        array.data_type()
+                    )
+                })?;
+            Ok((0..arr.len())
+                .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected TimestampSecondArray but found {}",
+                        array.data_type()
+                    )
+                })?;
+            Ok((0..arr.len())
+                .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected TimestampMillisecondArray but found {}",
+                        array.data_type()
+                    )
+                })?;
+            Ok((0..arr.len())
+                .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected TimestampMicrosecondArray but found {}",
+                        array.data_type()
+                    )
+                })?;
+            Ok((0..arr.len())
+                .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Expected TimestampNanosecondArray but found {}",
+                        array.data_type()
+                    )
+                })?;
+            Ok((0..arr.len())
+                .map(|i| (!arr.is_null(i)).then(|| arr.value(i)))
+                .collect())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 // Implement Display trait for ColumnarValue
 impl fmt::Display for ColumnarValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -465,7 +605,7 @@ impl fmt::Display for ColumnarValue {
 mod tests {
     use super::*;
     use arrow::{
-        array::{Date64Array, Int32Array, StructArray},
+        array::{Date32Array, Date64Array, Int32Array, StructArray},
         datatypes::{Field, Fields, TimeUnit},
     };
 
@@ -752,6 +892,33 @@ mod tests {
     }
 
     #[test]
+    fn try_cast_date_array_to_timestamp_overflow_returns_null() {
+        let array: ArrayRef = Arc::new(Date32Array::from(vec![Some(1), Some(i32::MAX)]));
+        let value = ColumnarValue::Array(array);
+        let cast_options = CastOptions {
+            safe: true,
+            format_options: DEFAULT_CAST_OPTIONS.format_options,
+        };
+
+        let result = value
+            .cast_to(
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                Some(&cast_options),
+            )
+            .expect("safe cast should return nulls for overflow");
+        let ColumnarValue::Array(array) = result else {
+            panic!("expected array after cast");
+        };
+        let array = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("expected TimestampNanosecondArray");
+
+        assert!(!array.is_null(0));
+        assert!(array.is_null(1));
+    }
+
+    #[test]
     fn cast_timestamp_array_to_timestamp_overflow() {
         let overflow_value = i64::MAX / 1_000_000_000 + 1;
         let array: ArrayRef =
@@ -765,5 +932,36 @@ mod tests {
                 .contains("converted value exceeds the representable i64 range"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn try_cast_timestamp_array_to_timestamp_overflow_returns_null() {
+        let overflow_value = i64::MAX / 1_000_000_000 + 1;
+        let array: ArrayRef = Arc::new(TimestampSecondArray::from(vec![
+            Some(1),
+            Some(overflow_value),
+        ]));
+        let value = ColumnarValue::Array(array);
+        let cast_options = CastOptions {
+            safe: true,
+            format_options: DEFAULT_CAST_OPTIONS.format_options,
+        };
+
+        let result = value
+            .cast_to(
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                Some(&cast_options),
+            )
+            .expect("safe cast should return nulls for overflow");
+        let ColumnarValue::Array(array) = result else {
+            panic!("expected array after cast");
+        };
+        let array = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("expected TimestampNanosecondArray");
+
+        assert_eq!(array.value(0), 1_000_000_000);
+        assert!(array.is_null(1));
     }
 }

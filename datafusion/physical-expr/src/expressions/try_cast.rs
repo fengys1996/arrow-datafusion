@@ -200,7 +200,7 @@ mod tests {
     use arrow::{
         array::{
             Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-            Int64Array, TimestampNanosecondArray, UInt32Array,
+            Int64Array, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
         },
         datatypes::*,
     };
@@ -592,6 +592,35 @@ mod tests {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             expected
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_cast_timestamp_overflow_returns_null() -> Result<()> {
+        let schema = Schema::new(vec![Field::new(
+            "a",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        )]);
+        let overflow_value = i64::MAX / 1_000_000_000 + 1;
+        let array = TimestampSecondArray::from(vec![Some(1), Some(overflow_value)]);
+        let batch =
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])?;
+        let expression = try_cast(
+            col("a", &schema)?,
+            &schema,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        )?;
+
+        let result = expression.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("failed to downcast");
+
+        assert_eq!(result.value(0), 1_000_000_000);
+        assert!(result.is_null(1));
+
         Ok(())
     }
 
